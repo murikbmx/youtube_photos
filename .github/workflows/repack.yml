@@ -1,0 +1,146 @@
+name: Repack module
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: "Приложение"
+        type: choice
+        options: [YouTube, GooglePhotos]
+        default: YouTube
+      patched:
+        description: "Пропатченный APK из релиза 'input' (пусто = самый новый подходящий)"
+        type: string
+        required: false
+      stock:
+        description: "Оригинал из релиза 'input' (пусто = найти по версии в 'input', затем в stock-apks morphe-module)"
+        type: string
+        required: false
+
+concurrency:
+  group: repack
+  cancel-in-progress: false
+
+jobs:
+  repack:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      APP: ${{ inputs.app }}
+      PATCHED_NAME: ${{ inputs.patched }}
+      STOCK_NAME: ${{ inputs.stock }}
+      INPUT_TAG: input
+      UPDATE_BRANCH: update
+    steps:
+      - uses: actions/setup-java@v6
+        with:
+          distribution: "zulu"
+          java-version: "21"
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Get the input files
+        id: input
+        run: |
+          set -euo pipefail
+          source apps.sh
+          "app_${APP}"
+          echo "prefix=${FILE_PREFIX}" >> "$GITHUB_OUTPUT"
+          if ! gh release view "$INPUT_TAG" >/dev/null 2>&1; then
+            gh release create "$INPUT_TAG" --prerelease --latest=false --title "Input APKs" \
+              --notes "Сюда загружается APK, пропатченный в Morphe Manager (любое имя файла), и при желании оригинал: <package>-<version>-arm64-v8a.apk (или .apkm)."
+            echo "::error::Релиз '$INPUT_TAG' только что создан. Загрузите в него пропатченный APK и запустите снова."
+            exit 1
+          fi
+          BT="$ANDROID_HOME/build-tools/$(ls -1 "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          echo "AAPT2=$BT/aapt2" >> "$GITHUB_ENV"
+          echo "ZIPALIGN=$BT/zipalign" >> "$GITHUB_ENV"
+          mkdir -p in
+          if [ -n "$PATCHED_NAME" ]; then
+            CANDIDATES=("$PATCHED_NAME")
+          else
+            # newest first; files named like the stock apk (<package>-...) are originals, not patched ones
+            mapfile -t CANDIDATES < <(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$INPUT_TAG" \
+              -q '.assets | sort_by(.created_at) | reverse | .[].name' | grep -iE '\.apk$' | grep -v "^${PKG}-" || :)
+          fi
+          FOUND=""
+          for N in "${CANDIDATES[@]}"; do
+            gh release download "$INPUT_TAG" -p "$N" -D in --clobber
+            P=$("$BT/aapt2" dump badging "in/$N" 2>/dev/null | head -1 | sed -n "s/.* name='\([^']*\)'.*/\1/p")
+            echo "$N: $P"
+            if [ "$P" = "$PKG" ] || [ -n "$PATCHED_NAME" ]; then FOUND="in/$N"; break; fi
+            rm -f "in/$N"
+          done
+          if [ -z "$FOUND" ]; then
+            echo "::error::В релизе '$INPUT_TAG' нет пропатченного APK для $PKG."
+            exit 1
+          fi
+          echo "patched=$FOUND" >> "$GITHUB_OUTPUT"
+          if [ -n "$STOCK_NAME" ]; then
+            gh release download "$INPUT_TAG" -p "$STOCK_NAME" -D in --clobber
+            echo "stock=in/$STOCK_NAME" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Next version code
+        id: ver
+        run: |
+          TAG=$(gh release list -L 400 --json tagName -q '.[].tagName' | grep -E '^[0-9]+$' | sort -n | tail -1 || :)
+          echo "tag=$(( ${TAG:-0} + 1 ))" >> "$GITHUB_OUTPUT"
+
+      - name: Build the module
+        id: build
+        env:
+          INPUT_REPO: ${{ github.repository }}
+          VERSION_CODE: ${{ steps.ver.outputs.tag }}
+          UPDATE_JSON: https://raw.githubusercontent.com/${{ github.repository }}/update/${{ steps.input.outputs.prefix }}-update.json
+          PATCHED_FILE: ${{ steps.input.outputs.patched }}
+          STOCK_FILE: ${{ steps.input.outputs.stock }}
+        run: |
+          set -euo pipefail
+          ARGS=("$APP" "$PATCHED_FILE")
+          if [ -n "$STOCK_FILE" ]; then ARGS+=("$STOCK_FILE"); fi
+          OUT=$(./repack.sh "${ARGS[@]}")
+          echo "out=$OUT" >> "$GITHUB_OUTPUT"
+          cat build/notes.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Release
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          OUT: ${{ steps.build.outputs.out }}
+        run: |
+          VER=$(unzip -p "$OUT" config | sed -n 's/^PKG_VER=//p')
+          gh release create "$TAG" "$OUT" --title "$APP $VER (Morphe Manager)" --notes-file build/notes.md --latest
+
+      - name: Update the module update file
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          OUT: ${{ steps.build.outputs.out }}
+          PREFIX: ${{ steps.input.outputs.prefix }}
+        run: |
+          cp build/notes.md "$RUNNER_TEMP/notes.md"
+          # the branch keeps the update files of every app, only this app's files are replaced
+          git checkout -f "$UPDATE_BRANCH" 2>/dev/null || git switch --discard-changes --orphan "$UPDATE_BRANCH"
+          PROP=$(unzip -p "$OUT" module.prop)
+          jq -n --arg v "$(sed -n 's/^version=//p' <<<"$PROP")" --argjson c "$(sed -n 's/^versionCode=//p' <<<"$PROP")" \
+            --arg z "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$TAG/${OUT##*/}" \
+            --arg l "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$UPDATE_BRANCH/${PREFIX}-changelog.md" \
+            '{version: $v, versionCode: $c, zipUrl: $z, changelog: $l}' >"${PREFIX}-update.json"
+          cp "$RUNNER_TEMP/notes.md" "${PREFIX}-changelog.md"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${PREFIX}-update.json" "${PREFIX}-changelog.md"
+          git commit -m "${APP}: release $TAG"
+          git push origin "HEAD:$UPDATE_BRANCH"
+
+      - name: Delete old releases
+        env:
+          KEEP: 10
+        run: |
+          gh release list -L 400 --json tagName,createdAt |
+            jq -r 'map(select(.tagName | test("^[0-9]+$"))) | sort_by(.createdAt) | reverse | .[env.KEEP | tonumber:][] | .tagName' |
+            while read -r OLD; do gh release delete "$OLD" --yes --cleanup-tag || :; done
